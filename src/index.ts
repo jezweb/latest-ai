@@ -33,6 +33,78 @@ const FLAGSHIPS: Record<string, string[]> = {
 	qwen: ['qwen.*-max', 'qwen.*-plus', 'qwen.*-flash(?!.*lite)'],
 };
 
+// Knowledge cutoff dates — manually maintained from provider docs.
+// Keys are OpenRouter model ID prefixes (matched with startsWith after provider/).
+// Values are "YYYY-MM" or "YYYY-MM-DD" strings.
+const KNOWLEDGE_CUTOFFS: Record<string, string> = {
+	// Anthropic — platform.claude.com/docs/en/docs/about-claude/models
+	'anthropic/claude-opus-4.6': '2025-05',
+	'anthropic/claude-sonnet-4.6': '2025-08',
+	'anthropic/claude-opus-4.5': '2025-03',
+	'anthropic/claude-sonnet-4.5': '2025-03',
+	'anthropic/claude-opus-4': '2025-03',
+	'anthropic/claude-sonnet-4': '2025-03',
+	'anthropic/claude-haiku-4.5': '2025-02',
+	// OpenAI — platform.openai.com/docs/models
+	'openai/gpt-4.1': '2024-06',
+	'openai/gpt-4.1-mini': '2024-06',
+	'openai/gpt-4.1-nano': '2024-06',
+	'openai/o3': '2024-06',
+	'openai/o3-mini': '2023-10',
+	'openai/gpt-4o': '2024-06',
+	'openai/gpt-4o-mini': '2023-10',
+	// Google — cloud.google.com/vertex-ai/generative-ai/docs/models
+	'google/gemini-2.5-pro': '2025-01',
+	'google/gemini-2.5-flash': '2025-01',
+	'google/gemini-2.0-flash': '2024-06',
+	// Meta — github.com/meta-llama/llama-models
+	'meta-llama/llama-4': '2024-08',
+	'meta-llama/llama-3.3': '2023-12',
+	// xAI — docs.x.ai/developers/models
+	'x-ai/grok-3': '2024-11',
+	// DeepSeek — community-confirmed
+	'deepseek/deepseek-v3': '2024-07',
+	'deepseek/deepseek-r1': '2024-07',
+	// Mistral — NVIDIA NIM model cards
+	'mistralai/mistral-large': '2024-10',
+	'mistralai/mistral-small': '2023-10',
+};
+
+// Direct API endpoints and model ID derivation rules per provider.
+// Providers without a widely-used direct API are omitted — use OpenRouter for those.
+const PROVIDER_APIS: Record<string, { url: string; transform?: (name: string) => string }> = {
+	anthropic: { url: 'https://api.anthropic.com/v1/messages', transform: (n) => n.replace(/\./g, '-') },
+	openai: { url: 'https://api.openai.com/v1/chat/completions' },
+	google: { url: 'https://generativelanguage.googleapis.com/v1beta/models' },
+	mistralai: { url: 'https://api.mistral.ai/v1/chat/completions' },
+	deepseek: { url: 'https://api.deepseek.com/chat/completions' },
+	'x-ai': { url: 'https://api.x.ai/v1/chat/completions' },
+	qwen: { url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions' },
+	cohere: { url: 'https://api.cohere.com/v2/chat' },
+};
+
+function toApiId(openRouterId: string): string | null {
+	const [provider, ...rest] = openRouterId.split('/');
+	const name = rest.join('/');
+	const api = PROVIDER_APIS[provider];
+	if (!api) return null;
+	return api.transform ? api.transform(name) : name;
+}
+
+function lookupKnowledgeCutoff(modelId: string): string | null {
+	// Try exact match first, then prefix match (longest prefix wins)
+	if (KNOWLEDGE_CUTOFFS[modelId]) return KNOWLEDGE_CUTOFFS[modelId];
+	let bestMatch: string | null = null;
+	let bestLen = 0;
+	for (const key of Object.keys(KNOWLEDGE_CUTOFFS)) {
+		if (modelId.startsWith(key) && key.length > bestLen) {
+			bestMatch = KNOWLEDGE_CUTOFFS[key];
+			bestLen = key.length;
+		}
+	}
+	return bestMatch;
+}
+
 // --- Types ---
 
 interface OpenRouterModel {
@@ -49,11 +121,13 @@ interface FilteredModel {
 	id: string;
 	name: string;
 	provider: string;
+	api_id: string | null;
 	context_length: number;
 	max_output: number | null;
 	pricing: { input: number; output: number };
 	modality: string;
 	released: string;
+	knowledge_cutoff: string | null;
 	flagship: boolean;
 }
 
@@ -103,6 +177,7 @@ async function fetchModels(days: number, providerFilter?: string): Promise<{ mod
 			id: m.id,
 			name: m.name,
 			provider: m.id.split('/')[0],
+			api_id: toApiId(m.id),
 			context_length: m.context_length,
 			max_output: m.top_provider?.max_completion_tokens ?? null,
 			pricing: {
@@ -111,6 +186,7 @@ async function fetchModels(days: number, providerFilter?: string): Promise<{ mod
 			},
 			modality: m.architecture?.modality ?? 'text->text',
 			released: new Date(m.created * 1000).toISOString().split('T')[0],
+			knowledge_cutoff: lookupKnowledgeCutoff(m.id),
 			flagship: flagshipIds.has(m.id),
 		}))
 		.sort((a, b) => {
@@ -146,6 +222,10 @@ function renderText(models: FilteredModel[], updated: string, days: number): str
 		`# Filter: ${PROVIDERS.length} providers, last ${days} days | Total: ${models.length} models`,
 		`# URL: https://models.flared.au/llms.txt`,
 		`# >>> = current flagship model for this provider tier`,
+		'#',
+		'# Direct API endpoints (for providers with public APIs):',
+		...Object.entries(PROVIDER_APIS).map(([p, a]) => `#   ${p}: ${a.url}`),
+		'# All models available via OpenRouter: https://openrouter.ai/api/v1/chat/completions',
 		'',
 	];
 
@@ -155,14 +235,12 @@ function renderText(models: FilteredModel[], updated: string, days: number): str
 			currentProvider = m.provider;
 			lines.push(`## ${currentProvider}`, '');
 		}
-		lines.push(m.flagship ? `>>> ${m.id}` : `    ${m.id}`);
+		const flag = m.flagship ? '>>> ' : '    ';
 		const ctx = formatTokens(m.context_length);
 		const out = m.max_output ? ` | Output: ${formatTokens(m.max_output)}` : '';
-		lines.push(`  Context: ${ctx}${out}`);
-		lines.push(`  Pricing: ${formatPrice(m.pricing.input)} / ${formatPrice(m.pricing.output)} per 1M tokens`);
-		lines.push(`  Modality: ${m.modality}`);
-		lines.push(`  Released: ${m.released}`);
-		lines.push('');
+		const cutoff = m.knowledge_cutoff ? ` | Cutoff: ${m.knowledge_cutoff}` : '';
+		const apiId = m.api_id && m.api_id !== m.id.split('/')[1] ? ` (api: ${m.api_id})` : '';
+		lines.push(`${flag}${m.id}  Context: ${ctx}${out}${cutoff} | ${m.modality}${apiId}`);
 	}
 
 	return lines.join('\n');
@@ -188,16 +266,20 @@ function renderHTML(models: FilteredModel[], updated: string, days: number): str
 	for (const m of models) {
 		if (m.provider !== currentProvider) {
 			currentProvider = m.provider;
-			rows += `<tr><td colspan="5" class="provider">${esc(currentProvider)}</td></tr>\n`;
+			rows += `<tr><td colspan="7" class="provider">${esc(currentProvider)}</td></tr>\n`;
 		}
 		const ctx = formatTokens(m.context_length);
 		const out = m.max_output ? formatTokens(m.max_output) : '-';
 		const cls = m.flagship ? ' class="flagship"' : '';
+		const cutoff = m.knowledge_cutoff ?? '-';
+		const apiId = m.api_id ?? '-';
 		rows += `<tr${cls}>
 <td class="id">${esc(m.id)}</td>
+<td class="api-id">${esc(apiId)}</td>
 <td>${ctx}</td>
 <td>${out}</td>
 <td>${formatPrice(m.pricing.input)} / ${formatPrice(m.pricing.output)}</td>
+<td>${cutoff}</td>
 <td>${m.released}</td>
 </tr>\n`;
 	}
@@ -210,15 +292,16 @@ function renderHTML(models: FilteredModel[], updated: string, days: number): str
 <title>Latest AI Models</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0a0a0a;color:#e5e5e5;padding:2rem;max-width:1100px;margin:0 auto;font-size:14px}
-h1{font-size:1.4rem;margin-bottom:.25rem;color:#fff}
-.meta{color:#737373;margin-bottom:1.5rem;font-size:13px}
+body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0a0a0a;color:#e5e5e5;padding:2rem;max-width:1600px;margin:0 auto;font-size:12px}
+h1{font-size:1.2rem;margin-bottom:.25rem;color:#fff}
+.meta{color:#737373;margin-bottom:1.5rem;font-size:11px}
 .meta a{color:#737373}
 table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:.5rem .75rem;border-bottom:1px solid #262626;color:#a3a3a3;font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
-td{padding:.4rem .75rem;border-bottom:1px solid #171717}
-.provider{font-weight:700;color:#fff;padding-top:1.2rem;font-size:15px;border-bottom:1px solid #262626}
+th{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #262626;color:#a3a3a3;font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+td{padding:.3rem .6rem;border-bottom:1px solid #171717}
+.provider{font-weight:700;color:#fff;padding-top:1rem;font-size:13px;border-bottom:1px solid #262626}
 .id{color:#60a5fa}
+.api-id{color:#a78bfa;font-size:11px}
 .flagship td{background:#111;color:#fff}
 .flagship .id{color:#93c5fd}
 tr:hover td:not(.provider){background:#111}
@@ -229,7 +312,7 @@ tr:hover td:not(.provider){background:#111}
 <p class="meta">Source: OpenRouter API | Updated: ${esc(updated)} | ${models.length} models, last ${days} days<br>
 <a href="/llms.txt">llms.txt</a> · <a href="/json">JSON</a></p>
 <table>
-<thead><tr><th>Model ID</th><th>Context</th><th>Output</th><th>Pricing (per 1M)</th><th>Released</th></tr></thead>
+<thead><tr><th>Model ID</th><th>API ID</th><th>Context</th><th>Output</th><th>Pricing (per 1M)</th><th>Knowledge Cutoff</th><th>Released</th></tr></thead>
 <tbody>
 ${rows}</tbody>
 </table>
